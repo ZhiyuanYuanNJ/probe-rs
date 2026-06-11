@@ -1,0 +1,121 @@
+[package]
+name = "probe-rs"
+version.workspace = true
+authors = [
+    "Noah Hüsser <yatekii@yatekii.ch>",
+    "Dominik Boehi <dominik.boehi@gmail.ch>",
+    "Jack Noppe <noppej@hotmail.com>",
+]
+edition.workspace = true
+description = "A collection of on chip debugging tools to communicate with microchips."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+categories = ["embedded", "hardware-support", "development-tools::debugging"]
+keywords = ["embedded"]
+license.workspace = true
+rust-version.workspace = true
+
+# Don't include test binaries in published crate
+exclude = ["tests/"]
+
+[features]
+default = ["builtin-targets", "cmsisdap_v1", "builtin-formats", "coredump"]
+flate2 = ["dep:flate2"]
+
+# Enable all built in targets.
+builtin-targets = ["dep:bincode", "dep:probe-rs-target"]
+cmsisdap_v1 = ["dep:hidapi"]
+
+# Enables the bin, hex, elf image formats
+builtin-formats = ["dep:uf2-decode", "object", "flate2", "dep:ihex"]
+
+coredump = ["object", "dep:rmp-serde", "dep:dunce"]
+
+# Enable helpers for testing
+test = ["object"]
+
+[dependencies]
+anyhow.workspace = true
+async-io.workspace = true
+docsplay.workspace = true
+thiserror.workspace = true
+probe-rs-target.workspace = true
+serde.workspace = true
+yaml_serde.workspace = true
+
+bincode = { version = "2", features = ["serde"], optional = true }
+bitfield = "0.19.0"
+bitvec = "1"
+hidapi = { version = "2.6.4", default-features = false, features = [
+    "linux-native-basic-udev",
+], optional = true }
+itertools = "0.14"
+jep106 = "0.3"
+object = { version = "0.39", default-features = false, features = [
+    "elf",
+    "read_core",
+    "std",
+], optional = true }
+nusb.workspace = true
+futures-lite = { version = "2", default-features = false }
+scroll = "0.13"
+serialport = { version = "4.7.0", default-features = false, features = [
+    "usbportinfo-interface",
+] }
+tracing = "0.1"
+parking_lot = "0.12.2"
+zerocopy = { version = "0.8.0", features = ["derive"] }
+cobs = "0.5"
+
+# optional
+
+# For flashing
+uf2-decode = { version = "0.2", optional = true }
+flate2 = { version = "1.0", optional = true }
+ihex = { version = "3.0", optional = true }
+
+hexdump = { version = "0.1", optional = true }
+
+# For coredump
+rmp-serde = { version = "1", optional = true }
+dunce = { version = "1.0.5", optional = true }
+
+[build-dependencies]
+probe-rs-target = { workspace = true, optional = true, features = ["bincode"] }
+
+[dev-dependencies]
+env_logger = "0.11"
+fastrand = "2.1"
+serde_json = "1"
+serde = "1"
+clap = { version = "4", features = ["derive"] }
+itm = { version = "0.9.0-rc.1", default-features = false }
+pretty_assertions = "1"
+test-case = "3"
+test-log = { version = "0.2.16", features = ["trace"] }
+insta = { version = "1.38", default-features = false }
+object = { version = "0.39", default-features = false, features = [
+    "elf",
+    "read_core",
+    "std",
+]}
+
+[[package.metadata.release.pre-release-replacements]]
+file = "../CHANGELOG.md"
+search = "## \\[Unreleased\\]"
+replace = "## [{{version}}]\n\nReleased {{date}}"
+[[package.metadata.release.pre-release-replacements]]
+file = "../CHANGELOG.md"
+search = "\\[unreleased\\]: https://github.com/probe-rs/probe-rs/compare/v([a-z0-9.-]+)\\.\\.\\.master"
+replace = "[unreleased]: https://github.com/probe-rs/probe-rs/compare/v{{version}}...master\n[{{version}}]: https://github.com/probe-rs/probe-rs/compare/v$1...v{{version}}"
+
+[package.metadata.docs.rs]
+features = ["builtin-targets"]
+
+# Define a new cfg flag for docs.rs
+rustdoc-args = ["--cfg", "probers_docsrs"]
+
+[lints]
+workspace = true

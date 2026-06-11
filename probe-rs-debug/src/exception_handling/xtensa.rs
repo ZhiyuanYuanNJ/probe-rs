@@ -1,0 +1,219 @@
+use std::{cell::RefCell, ops::ControlFlow};
+
+use crate::{
+    DebugError, DebugRegisters, StackFrame, exception_handling::ExceptionInterface,
+    unwind_pc_without_debuginfo,
+};
+
+use probe_rs::{
+    CoreRegister, InstructionSet, MemoryInterface, RegisterRole, RegisterValue, UnwindRule,
+};
+
+#[derive(Default)]
+pub struct XtensaExceptionHandler {
+    /// Single-entry cache of the most recent windowed-ABI unwind, keyed by the callee's stack
+    /// pointer. Avoids re-reading the spill area for each register when
+    /// [`Self::unwind_undefined_register`] is invoked repeatedly for the same frame.
+    cache: RefCell<Option<UnwindCache>>,
+}
+
+struct UnwindCache {
+    sp: u64,
+    unwound: DebugRegisters,
+}
+
+impl XtensaExceptionHandler {
+    /// Populate [`Self::cache`] with the windowed-ABI unwind result for `callee_frame_registers`,
+    /// reusing the previous result if the callee SP matches.
+    fn ensure_cached_unwind(
+        &self,
+        memory: &mut dyn MemoryInterface,
+        callee_frame_registers: &DebugRegisters,
+    ) -> Result<(), DebugError> {
+        let sp = callee_frame_registers.get_register_value_by_role(&RegisterRole::StackPointer)?;
+
+        if matches!(self.cache.borrow().as_ref(), Some(c) if c.sp == sp) {
+            return Ok(());
+        }
+
+        let mut scratch = callee_frame_registers.clone();
+        self.unwind_registers(memory, &mut scratch)?;
+        *self.cache.borrow_mut() = Some(UnwindCache {
+            sp,
+            unwound: scratch,
+        });
+
+        Ok(())
+    }
+
+    fn unwind_registers(
+        &self,
+        memory: &mut dyn MemoryInterface,
+        unwind_registers: &mut DebugRegisters,
+    ) -> Result<(), DebugError> {
+        // WindowUnderflow12:
+        // // On entry here: a0-a11 are call[i].reg[0..11] and initially contain garbage, a12-a15 are call[i+1].reg[0..3],
+        // // (in particular, a13 is call[i+1]’s stack pointer) and must be preserved
+        // l32e a0, a13, -16  // restore a0 from call[i+1]’s frame
+        // l32e a1, a13, -12  // restore a1 from call[i+1]’s frame
+        // l32e a2, a13, -8   // restore a2 from call[i+1]’s frame
+        // l32e a11, a1, -12  // a11 <- call[i-1]’s sp
+        // l32e a3, a13, -4   // restore a3 from call[i+1]’s frame
+        // l32e a4, a11, -48  // restore a4 from end of call[i]’s frame
+        // l32e a5, a11, -44  // restore a5 from end of call[i]’s frame
+        // l32e a6, a11, -40  // restore a6 from end of call[i]’s frame
+        // l32e a7, a11, -36  // restore a7 from end of call[i]’s frame
+        // l32e a8, a11, -32  // restore a8 from end of call[i]’s frame
+        // l32e a9, a11, -28  // restore a9 from end of call[i]’s frame
+        // l32e a10, a11, -24 // restore a10 from end of call[i]’s frame
+        // l32e a11, a11, -20 // restore a11 from end of call[i]’s frame
+        // rfwu
+
+        // We can try and use FP to unwind SP and RA that allows us to continue unwinding.
+
+        let ra = unwind_registers.get_register_value_by_role(&RegisterRole::ReturnAddress)?;
+        if ra == 0 {
+            return Ok(());
+        }
+
+        // Current register values.
+        let sp = unwind_registers.get_register_value_by_role(&RegisterRole::StackPointer)?;
+
+        if sp < 16 {
+            // Stack pointer is too low.
+            return Err(DebugError::Other(
+                "Stack pointer is too low to unwind".to_string(),
+            ));
+        }
+
+        let windowsize = (ra & 0xc000_0000) >> 30;
+
+        // Read A0-A3 from current stack frame's Register-Spill Area.
+        let mut stack_frame = [0; 4];
+        memory.read_32(sp - 16, &mut stack_frame)?;
+
+        let [a0, caller_sp, a2, a3] = stack_frame;
+
+        // TODO: use an architecture-appropriate value?
+        if (caller_sp as u64).saturating_sub(sp) > 0x1000_0000 {
+            // Stack pointer is too far away from the current stack pointer.
+            return Err(DebugError::Other(
+                "Stack pointer is too far away to unwind".to_string(),
+            ));
+        }
+
+        let regs_from_current_frame = [
+            (RegisterRole::ReturnAddress, a0),
+            (RegisterRole::StackPointer, caller_sp),
+            (RegisterRole::Core("a2"), a2),
+            (RegisterRole::Core("a3"), a3),
+        ];
+
+        for (role, value) in regs_from_current_frame {
+            let reg = unwind_registers.get_register_mut_by_role(&role).unwrap();
+            reg.value = Some(RegisterValue::from(value));
+        }
+
+        if windowsize > 1 {
+            // The rest of the registers are in the previous stack frame.
+            let Some(caller_sp) = caller_sp.checked_sub(12) else {
+                return Ok(());
+            };
+            let frame_sp = memory.read_word_32(caller_sp as u64)?;
+
+            // We've already read 4 registers out of windowsize * 4.
+            const AREGS: [&str; 8] = ["a4", "a5", "a6", "a7", "a8", "a9", "a10", "a11"];
+            let mut frame = [0; AREGS.len()];
+
+            let regs_to_read = windowsize * 4 - 4;
+            let frame_to_read = &mut frame[..regs_to_read as usize];
+
+            // For windowsize = 3(12 registers), the offset is -48
+            let sp_offset = 16 + 4 * regs_to_read;
+
+            let Some(frame_sp) = (frame_sp as u64).checked_sub(sp_offset) else {
+                return Ok(());
+            };
+
+            memory.read_32(frame_sp, &mut frame_to_read[..])?;
+
+            for (reg, reg_value) in AREGS.iter().zip(frame_to_read.iter().copied()) {
+                let reg = unwind_registers
+                    .get_register_mut_by_role(&RegisterRole::Core(reg))
+                    .unwrap();
+                reg.value = Some(RegisterValue::from(reg_value));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl ExceptionInterface for XtensaExceptionHandler {
+    fn unwind_without_debuginfo(
+        &self,
+        unwind_registers: &mut DebugRegisters,
+        frame_pc: u64,
+        _stack_frames: &[StackFrame],
+        instruction_set: Option<InstructionSet>,
+        memory: &mut dyn MemoryInterface,
+    ) -> ControlFlow<Option<DebugError>> {
+        // Use the default method to unwind PC.
+        unwind_pc_without_debuginfo(unwind_registers, frame_pc, instruction_set)?;
+
+        // TODO: this should be automatically handled by the caller.
+        match self.unwind_registers(memory, unwind_registers) {
+            Ok(_) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(Some(error)),
+        }
+    }
+
+    fn unwind_undefined_register(
+        &self,
+        debug_register: &CoreRegister,
+        callee_frame_registers: &DebugRegisters,
+        _unwind_cfa: Option<u64>,
+        memory: &mut dyn MemoryInterface,
+        register_rule: &mut String,
+    ) -> Result<Option<RegisterValue>, DebugError> {
+        if debug_register.register_has_role(RegisterRole::ProgramCounter) {
+            unreachable!("The program counter is handled separately")
+        }
+
+        if self
+            .ensure_cached_unwind(memory, callee_frame_registers)
+            .is_ok()
+        {
+            let cache = self.cache.borrow();
+            let new = cache
+                .as_ref()
+                .and_then(|c| c.unwound.get_register(debug_register.id))
+                .and_then(|r| r.value);
+            let old = callee_frame_registers
+                .get_register(debug_register.id)
+                .and_then(|r| r.value);
+
+            if new != old {
+                *register_rule = "Xtensa window spill (dwarf Undefined)".to_string();
+                return Ok(new);
+            }
+        }
+
+        Ok(match debug_register.unwind_rule {
+            UnwindRule::Preserve => {
+                *register_rule = "Preserve (dwarf Undefined)".to_string();
+                callee_frame_registers
+                    .get_register(debug_register.id)
+                    .and_then(|reg| reg.value)
+            }
+            UnwindRule::Clear => {
+                *register_rule = "Clear (dwarf Undefined)".to_string();
+                None
+            }
+            UnwindRule::SpecialRule => {
+                *register_rule = "Clear (no unwind rules specified)".to_string();
+                None
+            }
+        })
+    }
+}

@@ -1,0 +1,103 @@
+name: Open a release PR
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release
+        required: true
+        type: string
+
+jobs:
+  make-release-pr:
+    permissions:
+      id-token: write # Enable OIDC
+      pull-requests: write
+      contents: write
+    runs-on: ubuntu-latest
+    env:
+      BRANCH_NAME: create-release/${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The custom token is needed so that this workflow can trigger
+          # another workflow. By default, pushing tags from inside a workflow
+          # does not trigger other workflows, but using a custom PAT it does.
+          token: ${{ secrets.GH_PAT }}
+      - uses: chainguard-dev/actions/setup-gitsign@main
+      - name: Install cargo-release
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-release,cargo-semver-checks
+      - name: Install SSH
+        run: |
+          apt-get update -y && apt-get install openssh-client -y
+          eval $(ssh-agent -s -a $SSH_AUTH_SOCK)
+          echo "$SSH_SIGNING_KEY" | tr -d '\r' | ssh-add -
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+        env:
+          SSH_SIGNING_KEY: ${{ secrets.SSH_SIGNING_KEY }}
+          SSH_AUTH_SOCK: /tmp/ssh_agent.sock
+
+      - name: Git setup
+        run: |
+          git config user.name "probe-rs"
+          git config user.email "bot@probe.rs"
+          git config --global gpg.format ssh
+          git config --global user.signingkey 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGr8+OZiQ6EHlhZcsPbnbkiW0wBtgNYGR2J5SI+QOw9Q bot@probe.rs'
+          git fetch --unshallow
+          git fetch --tags
+
+      - name: Create branch
+        run: |
+          git checkout -b ${BRANCH_NAME}
+
+      - name: Update changelog
+        run: |
+          cargo xtask assemble-changelog --commit ${{ inputs.version }}
+        env:
+          SSH_AUTH_SOCK: /tmp/ssh_agent.sock
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+
+      - name: Bump versions
+        run: |
+          cargo release version ${{ inputs.version }} --exclude probe-rs-mi --execute --verbose --no-confirm --allow-branch ${BRANCH_NAME}
+          cargo release replace --execute --verbose --no-confirm
+          cargo release hook --execute --verbose --no-confirm
+          cargo release commit --execute --verbose --no-confirm --sign-commit
+        env:
+          SSH_AUTH_SOCK: /tmp/ssh_agent.sock
+
+      - name: Check semver compliance
+        run: |
+          cargo semver-checks check-release -p probe-rs -p probe-rs-targets
+
+      - name: Push branch
+        run: |
+          git push origin ${BRANCH_NAME}
+
+      - name: create pull request
+        run: |
+          # PR patch version releases against the corresponding release/$version branch
+          # and all other versions against master
+          IFS='.' read -ra version <<< "${{ inputs.version }}"
+          if [[ "${version[2]}" == "0" ]]
+          then
+            branch="master"
+          else
+            branch="release/${version[0]}.${version[1]}"
+          fi
+          gh pr create -B $branch -H "${BRANCH_NAME}"\
+            --title "Release ${{ inputs.version }}"\
+            --label "release"\
+            --label "changelog:skip"\
+            --body "Released packages are:
+
+          - probe-rs
+          - probe-rs-target
+          - target-gen
+          - probe-rs-tools
+          - probe-rs-mi
+          - probe-rs-debug"
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}

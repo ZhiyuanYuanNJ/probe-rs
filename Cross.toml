@@ -1,0 +1,17 @@
+[target.armv7-unknown-linux-gnueabihf]
+# The following lines can be uncommented to use a native
+# ARM image when compiling on a ARM machine, like the new Apple devices.
+#
+# This needs the master version of cross (as of 2023-02-05).
+
+#image.name = "ahuszagh/aarch64-cross:armv7-unknown-linux-gnueabihf"
+#image.toolchain = ["aarch64-unknown-linux-gnu"]
+
+[target.aarch64-unknown-linux-gnu]
+# The following lines can be uncommented to use a native
+# ARM image when compiling on a ARM machine, like the new Apple devices.
+#
+# This needs the master version of cross (as of 2023-02-05).
+
+# image.name = "ahuszagh/aarch64-cross:aarch64-unknown-linux-gnu"
+# image.toolchain = ["aarch64-unknown-linux-gnu"]

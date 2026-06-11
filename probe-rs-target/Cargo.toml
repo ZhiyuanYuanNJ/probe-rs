@@ -1,0 +1,31 @@
+[package]
+name = "probe-rs-target"
+version.workspace = true
+edition.workspace = true
+description = "Target description schema for probe-rs."
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+categories = ["embedded", "hardware-support", "development-tools::debugging"]
+keywords = ["embedded"]
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+jep106 = "0.3.0"
+serde = { version = "1", features = ["derive"] }
+base64 = "0.22.1"
+indexmap = { version = "2.2", features = ["serde"] }
+serde_with = { version = "3.8", default-features = false, features = [
+    "indexmap_2",
+] }
+
+bincode = { version = "2", features = ["serde"], optional = true }
+yaml_serde = { version = "0.10", optional = true }
+
+[features]
+bincode = ["dep:bincode", "dep:yaml_serde"]
+
+[lints]
+workspace = true

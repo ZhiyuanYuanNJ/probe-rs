@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+
+# It's a Mac Thing
+**/.DS_Store
+
+# IDE settings
+.vscode/settings.json
+.idea/
+.zed/
+
+# recorded profiles
+*.json.gz
