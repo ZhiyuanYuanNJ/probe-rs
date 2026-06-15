@@ -437,15 +437,21 @@ impl Ch347UsbJtagDevice {
     ///
     /// Returns the actual speed in kHz that was configured.
     pub(crate) fn swd_init(&mut self, speed_khz: u32) -> Result<u32, DebugProbeError> {
-        // Map speed_khz to delay byte.
-        // 0x00 = 5 MHz, 0x01 = 1 MHz, N >= 1 => 1/N MHz
-        let (delay_byte, actual_speed_khz) = if speed_khz >= 5000 {
+        // TODO:
+        // 根据输入时钟频率(单位kHz)计算对应的延时配置字节
+        // 配置规则：0x00 = 5 MHz，0x01 = 1 MHz，延时值 N ≥ 1 时，实际频率 = 1/N MHz
+        //
+        // 硬件支持5MHz速率，此版本此速率下概率存在异常
+        // 主要问题点在于，高速率的SWD，导致芯片返回WAIT，被误判为OK，DP寄存器置位sticky_orun标志
+        // 后续DP/AP读写操作会触发FAULT错误。经过逻辑分析仪实测，属于偶现问题。
+        // 5MHz需要用户主动指定 --speed 5000 才启用；未指定SWDSUV速率，默认1MHz
+        let (delay_byte, actual_speed_khz) = if speed_khz == 5000 {
             (0x00, 5000)
-        } else if speed_khz == 0 {
-            // Default to 1 MHz if no speed specified
+        } else if speed_khz >= 1000 || speed_khz == 0 {
+            // 频率大于等于1MHz且非精确5MHz时，统一使用1MHz配置
             (0x01, 1000)
         } else {
-            // 1/N MHz => delay = 1000/speed, clamped to at least 1
+            // 频率小于1MHz：按 1/N MHz 映射，例：500kHz → 延时2，250kHz → 延时4
             let delay = (1000 / speed_khz).max(1) as u8;
             let actual = 1000u32 / delay as u32;
             (delay, actual)
