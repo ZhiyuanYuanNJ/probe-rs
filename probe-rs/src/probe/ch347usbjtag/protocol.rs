@@ -10,6 +10,26 @@ use crate::probe::{
 
 use super::Ch347UsbJtagFactory;
 
+// ---------------------------------------------------------------------------
+// SWD protocol constants
+// ---------------------------------------------------------------------------
+
+/// SWD interface initialization command (speed configuration).
+const SWD_CMD_INIT: u8 = 0xE5;
+/// SWD data exchange command (contains sub-commands).
+const SWD_CMD_EXCHANGE: u8 = 0xE8;
+/// SWD register write sub-command.
+const SWD_SUB_REG_W: u8 = 0xA0;
+/// SWD custom sequence write sub-command.
+const SWD_SUB_SEQ_W: u8 = 0xA1;
+/// SWD register read sub-command.
+const SWD_SUB_REG_R: u8 = 0xA2;
+
+/// Send bit-width for SWD register write: 41 bits (8 request + 32 data + 1 parity).
+const SWD_REG_W_BIT_WIDTH: u8 = 0x29;
+/// Send bit-width for SWD register read: 34 bits (8 request + 26 turnaround/trailing).
+const SWD_REG_R_BIT_WIDTH: u8 = 0x22;
+
 pub(super) const CH34X_VID_PID: [(u16, u16); 3] =
     [(0x1A86, 0x55DE), (0x1A86, 0x55DD), (0x1A86, 0x55E8)];
 
@@ -402,6 +422,187 @@ impl Ch347UsbJtagDevice {
     pub(crate) fn read_captured_bits(&mut self) -> Result<BitVec, DebugProbeError> {
         self.flush()?;
         Ok(std::mem::take(&mut self.response))
+    }
+
+    // -----------------------------------------------------------------------
+    // SWD protocol methods
+    // -----------------------------------------------------------------------
+
+    /// Initialize the SWD interface with the given speed.
+    ///
+    /// Maps the requested speed (in kHz) to a CH347 delay byte:
+    /// - delay 0x00 = 5 MHz
+    /// - delay 0x01 = 1 MHz
+    /// - delay N (N≥1) = 1/N MHz
+    ///
+    /// Returns the actual speed in kHz that was configured.
+    pub(crate) fn swd_init(&mut self, speed_khz: u32) -> Result<u32, DebugProbeError> {
+        // Map speed_khz to delay byte.
+        // 0x00 = 5 MHz, 0x01 = 1 MHz, N >= 1 => 1/N MHz
+        let (delay_byte, actual_speed_khz) = if speed_khz >= 5000 {
+            (0x00, 5000)
+        } else if speed_khz == 0 {
+            // Default to 1 MHz if no speed specified
+            (0x01, 1000)
+        } else {
+            // 1/N MHz => delay = 1000/speed, clamped to at least 1
+            let delay = (1000 / speed_khz).max(1) as u8;
+            let actual = 1000u32 / delay as u32;
+            (delay, actual)
+        };
+
+        // Packet: 0xE5 + len(0x0008) + speed_param(4 bytes) + delay_byte + reserved(3 bytes)
+        let mut obuf = [0u8; 11];
+        obuf[0] = SWD_CMD_INIT;
+        obuf[1] = 0x08; // LEN low
+        obuf[2] = 0x00; // LEN high
+        obuf[3] = 0x40; // speed param byte 0
+        obuf[4] = 0x42; // speed param byte 1
+        obuf[5] = 0x0F; // speed param byte 2
+        obuf[6] = 0x00; // speed param byte 3
+        obuf[7] = delay_byte;
+        obuf[8] = 0x00; // reserved
+        obuf[9] = 0x00; // reserved
+        obuf[10] = 0x00; // reserved
+
+        self.usb_write(&obuf)?;
+
+        let mut ibuf = [0u8; 4];
+        self.usb_read(&mut ibuf)?;
+
+        if ibuf[0] == SWD_CMD_INIT && ibuf[3] == 0x00 {
+            tracing::info!(
+                "CH347 SWD initialized: delay_byte={delay_byte:#04x}, actual_speed={actual_speed_khz} kHz"
+            );
+            self.speed_khz = actual_speed_khz;
+            Ok(actual_speed_khz)
+        } else {
+            Err(DebugProbeError::Usb(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("CH347 SWD init failed: response = {:02x?}", ibuf),
+            )))
+        }
+    }
+
+    /// Perform an SWD register write (sub-command 0xA0).
+    ///
+    /// The CH347 firmware handles the complete SWD transaction:
+    /// request phase, data phase, and parity.
+    ///
+    /// Returns `(ack, status)` where:
+    /// - `ack`: 3-bit ACK result (lower 3 bits)
+    /// - `status`: command status (0x00 = success)
+    pub(crate) fn swd_register_write(
+        &mut self,
+        request: u8,
+        data: u32,
+    ) -> Result<(u8, u8), DebugProbeError> {
+        // Compute odd parity of the 32-bit write data
+        let parity = (data.count_ones() % 2 == 1) as u8;
+
+        // Build the 0xE8 packet with 0xA0 sub-command:
+        // [0xE8, LEN_lo, LEN_hi, 0xA0, 0x29, 0x00, request, data[0..4], parity]
+        let data_bytes = data.to_le_bytes();
+        let mut obuf = [0u8; 12];
+        obuf[0] = SWD_CMD_EXCHANGE;
+        obuf[1] = 0x09; // LEN low (9 bytes of sub-command data)
+        obuf[2] = 0x00; // LEN high
+        obuf[3] = SWD_SUB_REG_W;
+        obuf[4] = SWD_REG_W_BIT_WIDTH;
+        obuf[5] = 0x00;
+        obuf[6] = request;
+        obuf[7] = data_bytes[0];
+        obuf[8] = data_bytes[1];
+        obuf[9] = data_bytes[2];
+        obuf[10] = data_bytes[3];
+        obuf[11] = parity;
+
+        self.usb_write(&obuf)?;
+
+        // Response: [0xE8, LEN_lo, LEN_hi, 0xA0(echo), ack]
+        // Note: per the CH347 SWD example, each sub-command response is
+        // prefixed with the sub-command code echo, NOT a separate "status"
+        // byte. The 0xA0 write sub-response is therefore 2 bytes total
+        // (echo + 3-bit SWD ACK), giving 5 bytes on the wire including the
+        // [E8 LEN_lo LEN_hi] header.
+        let mut ibuf = [0u8; 5];
+        self.usb_read(&mut ibuf)?;
+
+        let ack = ibuf[4];
+        // Keep the second tuple field for API compatibility — it now mirrors
+        // the ACK and is unused by the caller for control flow.
+        Ok((ack, ack))
+    }
+
+    /// Perform an SWD register read (sub-command 0xA2).
+    ///
+    /// The CH347 firmware handles the complete SWD transaction:
+    /// request phase, turnaround, data read, and parity.
+    ///
+    /// Returns `(ack, data, parity_trace)` where:
+    /// - `ack`: 3-bit ACK result (lower 3 bits)
+    /// - `data`: 32-bit read value
+    /// - `parity_trace`: bit 0 = odd parity of data, bit 1 = trace bit
+    pub(crate) fn swd_register_read(&mut self, request: u8) -> Result<(u8, u32, u8), DebugProbeError> {
+        // Build the 0xE8 packet with 0xA2 sub-command:
+        // [0xE8, LEN_lo, LEN_hi, 0xA2, 0x22, 0x00, request]
+        let obuf = [SWD_CMD_EXCHANGE, 0x04, 0x00, SWD_SUB_REG_R, SWD_REG_R_BIT_WIDTH, 0x00, request];
+
+        self.usb_write(&obuf)?;
+
+        // Response: [0xE8, LEN_lo, LEN_hi, 0xA2(echo), ack, data[0..4], parity_trace]
+        // The 0xA2 read sub-response is 7 bytes (echo + ack + 4 data + parity),
+        // giving 10 bytes on the wire including the [E8 LEN_lo LEN_hi] header.
+        let mut ibuf = [0u8; 10];
+        self.usb_read(&mut ibuf)?;
+
+        let ack = ibuf[4];
+        let data = u32::from_le_bytes([ibuf[5], ibuf[6], ibuf[7], ibuf[8]]);
+        let parity_trace = ibuf[9];
+        Ok((ack, data, parity_trace))
+    }
+
+    /// Send an SWD custom bit sequence (sub-command 0xA1).
+    ///
+    /// Used for line resets and SWJ protocol sequences.
+    /// Bits not filling a complete byte should be padded with 0x00.
+    ///
+    /// Returns the command status (0x00 = success).
+    pub(crate) fn swd_sequence(
+        &mut self,
+        bit_count: u8,
+        data: &[u8],
+    ) -> Result<u8, DebugProbeError> {
+        // Build the 0xE8 packet with 0xA1 sub-command:
+        // [0xE8, LEN_lo, LEN_hi, 0xA1, bit_count, 0x00, data...]
+        let sub_len = 3 + data.len(); // sub-command header (3) + data bytes
+        let mut obuf = vec![0u8; 3 + sub_len];
+        obuf[0] = SWD_CMD_EXCHANGE;
+        obuf[1] = (sub_len & 0xFF) as u8; // LEN low
+        obuf[2] = ((sub_len >> 8) & 0xFF) as u8; // LEN high
+        obuf[3] = SWD_SUB_SEQ_W;
+        obuf[4] = bit_count;
+        obuf[5] = 0x00;
+        obuf[6..].copy_from_slice(data);
+
+        self.usb_write(&obuf)?;
+
+        // Response: [0xE8, LEN_lo, LEN_hi, 0xA1(echo)]
+        // The 0xA1 sequence sub-response is just the echo byte — no separate
+        // status. A successful sequence is implicit in receiving the echo.
+        let mut ibuf = [0u8; 4];
+        self.usb_read(&mut ibuf)?;
+
+        // Return 0x00 to keep the existing "0x00 = success" contract with
+        // callers; treat any non-echo value as a transport error.
+        if ibuf[3] == SWD_SUB_SEQ_W {
+            Ok(0)
+        } else {
+            Err(DebugProbeError::Usb(std::io::Error::other(format!(
+                "CH347 SWD sequence: unexpected echo byte {:#04x}",
+                ibuf[3]
+            ))))
+        }
     }
 }
 
