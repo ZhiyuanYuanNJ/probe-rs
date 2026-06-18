@@ -419,27 +419,41 @@ impl Ch347UsbJtag {
         // Build the SWD request byte for writing
         let request = build_swd_request(address, false);
 
+        // Pack post-write idle cycles with the write command and enforce a 32-cycle minimum. This prevents sporadic faults from un-drained AP buffered writes at high speeds without adding communication overhead.
+        let pre_idle: u8 = self
+            .swd_settings
+            .idle_cycles_before_write_verify
+            .max(32)
+            .min(255) as u8;
+        let pre_idle_data = [0u8; 32]; // pad buffer; 16 is the typical value
+
         for attempt in 0..=num_retries {
             // Idle cycles between WAIT-retries are now inserted in the
             // WAIT match arm itself, so the loop body just issues the
             // transaction directly.
-            let (ack, _status) = self.device.swd_register_write(request, value)?;
+            let ack = if address.is_ap() {
+                // AP write: pack the trailing idle into the same E8 packet
+                // — saves one USB round-trip per AP write on the OK path,
+                // and gives WAIT recovery a head-start.
+                self.device.swd_register_write_with_trailing_idle(
+                    request,
+                    value,
+                    pre_idle,
+                    &pre_idle_data,
+                )?
+            } else {
+                // DP write: no trailing idle, no RDBUFF — keep the original
+                // single-sub-command path.
+                let (a, _) = self.device.swd_register_write(request, value)?;
+                a
+            };
 
             match ack & 0x07 {
                 0x01 => {
-                    // OK — for AP writes, follow with a RDBUFF read to verify
-                    // the buffered write actually drained to the target bus.
-                    //
-                    // Insert idle cycles BEFORE the RDBUFF read (mirrors
-                    // `idle_cycles_before_write_verify` in the polyfill
-                    // implementation): without these the AP doesn't have time
-                    // to commit the buffered write, RDBUFF returns WAIT,
-                    // and we'd waste a retry round on a perfectly normal
-                    // condition.
+                    // OK — for AP writes the trailing idle was already sent
+                    // in the same E8 packet above; just verify the buffered
+                    // write drained to the bus via RDBUFF.
                     if address.is_ap() {
-                        let pre_idle = self.swd_settings.idle_cycles_before_write_verify.max(8);
-                        let idle_data = vec![0u8; (pre_idle + 7) / 8];
-                        self.device.swd_sequence(pre_idle as u8, &idle_data)?;
                         self.swd_read_rdbuff()?;
                     }
                     return Ok(());

@@ -437,21 +437,14 @@ impl Ch347UsbJtagDevice {
     ///
     /// Returns the actual speed in kHz that was configured.
     pub(crate) fn swd_init(&mut self, speed_khz: u32) -> Result<u32, DebugProbeError> {
-        // TODO:
-        // 根据输入时钟频率(单位kHz)计算对应的延时配置字节
-        // 配置规则：0x00 = 5 MHz，0x01 = 1 MHz，延时值 N ≥ 1 时，实际频率 = 1/N MHz
-        //
-        // 硬件支持5MHz速率，此版本此速率下概率存在异常
-        // 主要问题点在于，高速率的SWD，导致芯片返回WAIT，被误判为OK，DP寄存器置位sticky_orun标志
-        // 后续DP/AP读写操作会触发FAULT错误。经过逻辑分析仪实测，属于偶现问题。
-        // 5MHz需要用户主动指定 --speed 5000 才启用；未指定SWDSUV速率，默认1MHz
-        let (delay_byte, actual_speed_khz) = if speed_khz == 5000 {
+        let (delay_byte, actual_speed_khz) = if speed_khz >= 5000 || speed_khz == 0 {
+            // 默认或请求 ≥5 MHz：使用 5 MHz 档（delay=0x00）
             (0x00, 5000)
-        } else if speed_khz >= 1000 || speed_khz == 0 {
-            // 频率大于等于1MHz且非精确5MHz时，统一使用1MHz配置
+        } else if speed_khz >= 1000 {
+            // 1-5 MHz 统一到 1 MHz
             (0x01, 1000)
         } else {
-            // 频率小于1MHz：按 1/N MHz 映射，例：500kHz → 延时2，250kHz → 延时4
+            // <1 MHz：按 1/N MHz 映射，例：500 kHz → delay 2，250 kHz → delay 4
             let delay = (1000 / speed_khz).max(1) as u8;
             let actual = 1000u32 / delay as u32;
             (delay, actual)
@@ -538,6 +531,80 @@ impl Ch347UsbJtagDevice {
         // Keep the second tuple field for API compatibility — it now mirrors
         // the ACK and is unused by the caller for control flow.
         Ok((ack, ack))
+    }
+
+    /// Perform an SWD register write (0xA0) followed by a trailing idle
+    /// sequence (0xA1), packed into a single 0xE8 packet.
+    ///
+    /// This saves one USB round-trip on the AP-write OK path: instead of
+    /// `[E8 A0 …] → response → [E8 A1 …] → response → [E8 A2 RDBUFF …]`
+    /// (3 round-trips), the caller now does
+    /// `[E8 A0 … A1 …] → response → [E8 A2 RDBUFF …]` (2 round-trips).
+    ///
+    /// Behaviour on WAIT/FAULT is unchanged: the firmware executes both
+    /// sub-commands back-to-back regardless of the A0 ACK, so a WAIT just
+    /// means the target got `idle_bits` extra clock cycles for free
+    /// before the host's normal WAIT recovery kicks in. The A1 sequence
+    /// has no meaningful failure mode.
+    ///
+    /// `idle_bits` must be in `1..=255`. `idle_data` must hold at least
+    /// `ceil(idle_bits / 8)` bytes of pad (typically all-zero).
+    ///
+    /// Returns the SWD ACK byte from the A0 sub-response (lower 3 bits
+    /// are the meaningful ACK).
+    pub(crate) fn swd_register_write_with_trailing_idle(
+        &mut self,
+        request: u8,
+        data: u32,
+        idle_bits: u8,
+        idle_data: &[u8],
+    ) -> Result<u8, DebugProbeError> {
+        debug_assert!(idle_bits > 0, "idle_bits must be > 0");
+        let idle_byte_count = ((idle_bits as usize) + 7) / 8;
+        debug_assert!(
+            idle_data.len() >= idle_byte_count,
+            "idle_data too short for {} bits",
+            idle_bits
+        );
+
+        let parity = (data.count_ones() % 2 == 1) as u8;
+        let data_bytes = data.to_le_bytes();
+
+        // Sub-payload layout:
+        //   A0 sub-command — 9 bytes: A0 29 00 [req] [d0..d3] [parity]
+        //   A1 sub-command — 3 + idle_byte_count: A1 [bit_count] 00 [data..]
+        let sub_total = 9 + 3 + idle_byte_count;
+        let mut obuf = Vec::with_capacity(3 + sub_total);
+        obuf.push(SWD_CMD_EXCHANGE);
+        obuf.push((sub_total & 0xFF) as u8);
+        obuf.push(((sub_total >> 8) & 0xFF) as u8);
+        // A0 — register write
+        obuf.push(SWD_SUB_REG_W);
+        obuf.push(SWD_REG_W_BIT_WIDTH);
+        obuf.push(0x00);
+        obuf.push(request);
+        obuf.extend_from_slice(&data_bytes);
+        obuf.push(parity);
+        // A1 — trailing idle sequence
+        obuf.push(SWD_SUB_SEQ_W);
+        obuf.push(idle_bits);
+        obuf.push(0x00);
+        obuf.extend_from_slice(&idle_data[..idle_byte_count]);
+
+        self.usb_write(&obuf)?;
+
+        // Response: [E8 LL LL] [A0 ack] [A1] = 3 + 2 + 1 = 6 bytes.
+        let mut ibuf = [0u8; 6];
+        self.usb_read(&mut ibuf)?;
+
+        if ibuf[3] != SWD_SUB_REG_W || ibuf[5] != SWD_SUB_SEQ_W {
+            return Err(DebugProbeError::Usb(std::io::Error::other(format!(
+                "CH347 SWD batched write+idle: unexpected echoes {:#04x} {:#04x}",
+                ibuf[3], ibuf[5]
+            ))));
+        }
+
+        Ok(ibuf[4])
     }
 
     /// Perform an SWD register read (sub-command 0xA2).
